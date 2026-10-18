@@ -378,7 +378,8 @@ impl AppState {
         let became_free = placement(&object) == Some(Placement::Free)
             && (placement(before) != Some(Placement::Free) || self.flow_chain(index).is_some());
         let became_flow = placement(&object) == Some(Placement::Flow)
-            && placement(before) != Some(Placement::Flow);
+            && placement(before) != Some(Placement::Flow)
+            && before.sequence.is_none();
         let changes_anchor =
             before.sequence.is_some() && before.frame.position != object.frame.position;
         if !became_free && !became_flow && !changes_anchor {
@@ -627,13 +628,25 @@ impl AppState {
         let source_chain = self.flow_chain(from);
         let target_chain = self.flow_chain(to);
         if self.is_free_layout() {
-            if let Err(error) = ptouch_render::sequence::reorder(&mut self.elements, from, to) {
+            if let Err(error) = ptouch_render::sequence::reorder(
+                &mut self.elements,
+                from,
+                to,
+                self.document_version,
+            ) {
                 self.status_message = error.to_string();
                 return false;
             }
         } else {
             let item = self.elements.remove(from);
             self.elements.insert(to, item);
+        }
+        if self
+            .elements
+            .iter()
+            .any(|e| e.as_object().is_some_and(|o| o.sequence.is_some()))
+        {
+            self.document_version = self.document_version.max(13);
         }
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.select_canvas_target(Some(CanvasTarget {
@@ -1064,16 +1077,17 @@ impl AppState {
         {
             new.sequence = source.sequence;
             new.frame.position = PositionMode::Relative;
-            new.frame.gap_mm = if source.frame.position == PositionMode::Relative {
-                source.frame.gap_mm
-            } else {
-                insertion
-                    .and_then(|i| self.slot_followers(i).first().copied())
-                    .and_then(|i| self.elements.get(i))
-                    .and_then(|e| e.as_object())
-                    .filter(|o| o.frame.position == PositionMode::Relative)
-                    .map_or(3.0, |o| o.frame.gap_mm)
-            };
+            new.frame.gap_mm =
+                if source.frame.position == PositionMode::Relative || self.document_version >= 13 {
+                    source.frame.gap_mm
+                } else {
+                    insertion
+                        .and_then(|i| self.slot_followers(i).first().copied())
+                        .and_then(|i| self.elements.get(i))
+                        .and_then(|e| e.as_object())
+                        .filter(|o| o.frame.position == PositionMode::Relative)
+                        .map_or(3.0, |o| o.frame.gap_mm)
+                };
             new.frame.height_mm = source.frame.height_mm;
             new.frame.y_mm = source.frame.y_mm;
             if let Some(policy) = &mut new.layout {
@@ -1134,6 +1148,12 @@ impl AppState {
     }
 
     pub(crate) fn duplicate_element_base(&mut self, index: usize) -> bool {
+        if self.elements.get(index).is_none() {
+            return false;
+        }
+        if self.flow_chain(index).is_some() {
+            self.prepare_sequence_spacing();
+        }
         let sequence = !self.slot_followers(index).is_empty()
             || self.flow_chain(index).is_some()
             || self
@@ -1157,17 +1177,19 @@ impl AppState {
         {
             if sequence {
                 frame.position = PositionMode::Relative;
-                frame.gap_mm = self
-                    .elements
-                    .get(
-                        self.slot_followers(index)
-                            .first()
-                            .copied()
-                            .unwrap_or(self.elements.len()),
-                    )
-                    .and_then(slot_frame)
-                    .filter(|f| f.position == PositionMode::Relative)
-                    .map_or(3.0, |f| f.gap_mm);
+                if self.document_version < 13 {
+                    frame.gap_mm = self
+                        .elements
+                        .get(
+                            self.slot_followers(index)
+                                .first()
+                                .copied()
+                                .unwrap_or(self.elements.len()),
+                        )
+                        .and_then(slot_frame)
+                        .filter(|f| f.position == PositionMode::Relative)
+                        .map_or(3.0, |f| f.gap_mm);
+                }
             } else {
                 frame.x_mm = self
                     .default_object_frame(frame.width_mm, frame.height_mm)
@@ -1223,6 +1245,12 @@ impl AppState {
     }
 
     pub(crate) fn delete_element_base(&mut self, index: usize) -> bool {
+        if self.elements.get(index).is_none() {
+            return false;
+        }
+        if self.flow_chain(index).is_some() {
+            self.prepare_sequence_spacing();
+        }
         let Some(element) = self.elements.get(index) else {
             return false;
         };
@@ -1261,7 +1289,9 @@ impl AppState {
         {
             next.position = anchor.position;
             next.x_mm = anchor.x_mm;
-            next.gap_mm = anchor.gap_mm;
+            if self.document_version < 13 {
+                next.gap_mm = anchor.gap_mm;
+            }
         }
         if let Some(selected) = &mut self.selected_element
             && *selected > index
@@ -1274,6 +1304,18 @@ impl AppState {
         self.status_message = "Deleted object".into();
         self.mark_dirty();
         true
+    }
+
+    fn prepare_sequence_spacing(&mut self) {
+        if self.document_version < 13
+            && self
+                .elements
+                .iter()
+                .any(|e| e.as_object().is_some_and(|o| o.sequence.is_some()))
+        {
+            ptouch_render::sequence::prepare_spacing(&mut self.elements, self.document_version);
+            self.document_version = 13;
+        }
     }
 
     pub fn add_text(&mut self) {

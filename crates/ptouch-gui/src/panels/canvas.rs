@@ -588,6 +588,7 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         && let Some(before) = &drag.before
                     {
                         state.elements = before.elements.clone();
+                        state.document_version = before.version;
                         state.select_canvas_target(Some(CanvasTarget {
                             element: drag.element,
                             edit: CanvasEditTarget::Slot,
@@ -597,8 +598,9 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                         } else {
                             state.mark_dirty();
                         }
+                        let selected = state.selected_element.unwrap_or(drag.element);
                         state.select_canvas_target(Some(CanvasTarget {
-                            element: to,
+                            element: selected,
                             edit: CanvasEditTarget::Slot,
                         }));
                         reorder.current = to;
@@ -614,7 +616,10 @@ pub fn show_canvas(ui: &mut egui::Ui, state: &mut AppState) {
                             }
                         });
                     }
-                    if let Some(g) = geometry.iter().find(|g| g.element == reorder.current) {
+                    if let Some(g) = geometry
+                        .iter()
+                        .find(|g| Some(g.element) == state.selected_element)
+                    {
                         let x = g.slot.left();
                         painter.line_segment(
                             [
@@ -1956,6 +1961,103 @@ mod tests {
         canvas_event(&context, &mut state, vec![pointer_button(end, false)]);
         assert_eq!(state.canvas_drag_target, None);
         assert_eq!(state.canvas_hover_target, None);
+    }
+
+    #[test]
+    fn held_sequence_drag_restores_legacy_spacing_and_keeps_attached_host_selected() {
+        use ptouch_render::document::{LabelElement, LabelObject};
+        use ptouch_render::object_layout::{LayoutOptions, Placement, WidthSizing};
+        let context = egui::Context::default();
+        let mut state = AppState {
+            document_version: 12,
+            zoom_fit: false,
+            zoom: 2.0,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            let mut object = LabelObject::text(
+                format!("P{i}"),
+                TextBox {
+                    width_mm: 14.5,
+                    height_mm: 8.0,
+                    position: if i == 0 {
+                        PositionMode::Absolute
+                    } else {
+                        PositionMode::Relative
+                    },
+                    gap_mm: [0.0, 2.8, 3.1][i],
+                    ..Default::default()
+                },
+            );
+            object.sequence = Some(1);
+            object.content_box = Some(ContentBox {
+                width_mm: 8.0,
+                height_mm: 6.0,
+                offset_x_mm: 0.0,
+                offset_y_mm: 0.0,
+            });
+            object.layout = Some(LayoutOptions {
+                placement: Placement::Flow,
+                width: WidthSizing::Fixed,
+                constrain: false,
+                padding_mm: 0.0,
+            });
+            state.elements.push(LabelElement::Object(object));
+        }
+        assert!(state.add_overlay_text(0));
+        assert!(state.add_overlay_text(1));
+        state.select_canvas_target(Some(CanvasTarget {
+            element: 0,
+            edit: CanvasEditTarget::Slot,
+        }));
+        render_fixture(&context, &mut state);
+        let before = state.document();
+        let id = state.elements[0]
+            .as_object()
+            .unwrap()
+            .scene
+            .as_ref()
+            .unwrap()
+            .id;
+        let output = canvas_event(&context, &mut state, vec![]);
+        let quad = selected_quad(&output);
+        let start = (quad[0] + quad[3].to_vec2()) / 2.0;
+        canvas_event(
+            &context,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(start),
+                pointer_button(start, true),
+            ],
+        );
+        for offset in [610.0, 350.0, 0.0, 610.0] {
+            let end = start + egui::vec2(offset, 0.0);
+            canvas_event(&context, &mut state, vec![egui::Event::PointerMoved(end)]);
+            let selected = state.selected_element.unwrap();
+            assert_eq!(
+                state.elements[selected]
+                    .as_object()
+                    .unwrap()
+                    .scene
+                    .as_ref()
+                    .unwrap()
+                    .id,
+                id
+            );
+            if offset == 0.0 {
+                assert_eq!(state.document(), before);
+            } else {
+                assert_eq!(state.document().version, 13);
+                assert_eq!(
+                    state.elements[selected].as_object().unwrap().frame.gap_mm,
+                    2.8
+                );
+            }
+            render_fixture(&context, &mut state);
+        }
+        let end = start + egui::vec2(610.0, 0.0);
+        canvas_event(&context, &mut state, vec![pointer_button(end, false)]);
+        assert!(state.canvas_drag_target.is_none());
     }
 
     #[test]

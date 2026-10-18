@@ -350,7 +350,8 @@ fn attached_child_cannot_push_flow_and_follows_a_later_or_reordered_host() {
         if tagged {
             let from = by_id(&doc, next_id);
             let to = by_id(&doc, host_id);
-            ptouch_render::sequence::reorder(&mut doc.elements, from, to).unwrap();
+            ptouch_render::sequence::reorder(&mut doc.elements, from, to, doc.version).unwrap();
+            doc.version = 13;
             let host = by_id(&doc, host_id);
             let child = by_id(&doc, child_id);
             let world = scene::world_frames(&doc.elements).unwrap();

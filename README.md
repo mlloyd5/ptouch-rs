@@ -240,17 +240,21 @@ Drag sequence rows in the element list to change their physical order. Free
 objects retain their coordinates when list order changes; their context menu
 provides **Swap positions with previous**. **Swap content with previous** exchanges
 content and its transforms between fixed allocations, retaining template positions.
-Moving a sequence row into another sequence adopts its spacing and preserves
-both sequence origins. The insertion preview identifies the move. Independent
-rows can appear between sequence members without changing their positions or
-links. Switching to **Free positioning** unlinks only that object and leaves
-its neighbours in place. These edits use layout format v11, which stores a
-`sequence` identifier on linked objects; older layouts retain their original
-format until a sequence edit needs the new links.
-Attached objects appear beneath their host and move with it in **Layout order**.
-Moving across independent sequences keeps their fixed starts. For a continuous
-strip, select the next sequence's first object, use **Adjust layout… → After
-previous**, and set **Gap before**. Attached rows do not count as predecessors.
+**Up/Down** reorders within the current sequence. Sequence headers show their fixed
+X origin. Dragging into another sequence explicitly moves the object and its
+attachments, retaining its gap and both origins. Independent rows can appear
+between sequence members without changing their positions or links.
+
+For one continuous row, click **Connect** at the next sequence header. This joins
+the whole sequence and preserves its current positions. Select its first object
+and adjust **Gap before** to change the spacing. Attached rows never count as
+layout predecessors. Switching to **Free positioning** unlinks only that object
+and leaves its neighbours in place.
+
+Sequence reordering and connecting use format v13. Every object retains its own
+incoming gap, even while it is first in a sequence; moving it back restores its
+spacing. Older files keep their format and appearance until a structural edit.
+The application version is always available at the bottom right. Click it for **Info**.
 Untouched older layouts combine black pixels at overlaps; white remains transparent.
 
 **Allocation width** reserves the object's full space in a sequence. **Gap before**

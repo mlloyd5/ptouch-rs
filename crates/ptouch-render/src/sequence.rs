@@ -184,38 +184,56 @@ pub fn materialize(elements: &mut [LabelElement]) -> Result<()> {
     Ok(())
 }
 
-fn anchors(elements: &[LabelElement]) -> BTreeMap<u64, (TextBox, f64)> {
+fn anchors(elements: &[LabelElement]) -> BTreeMap<u64, f64> {
     let mut anchors = BTreeMap::new();
-    for (i, e) in elements.iter().enumerate() {
+    for e in elements {
         if let Some(o) = e.as_object()
             && let Some(id) = o.sequence
         {
-            anchors.entry(id).or_insert_with(|| {
-                let gap = elements[i + 1..]
-                    .iter()
-                    .filter_map(LabelElement::as_object)
-                    .find(|o| o.sequence == Some(id))
-                    .map_or(3.0, |o| o.frame.gap_mm);
-                (o.frame.clone(), gap)
-            });
+            anchors.entry(id).or_insert(o.frame.x_mm);
         }
     }
     anchors
 }
 
-fn normalize(elements: &mut [LabelElement], anchors: &BTreeMap<u64, (TextBox, f64)>) {
+/// Before v13 a head's gap was inactive scratch data. Initialize it once,
+/// before structural editing, without moving any allocation. In v13 it is
+/// dormant incoming spacing and survives promotion, demotion and persistence.
+fn initialize_head_spacing(elements: &mut [LabelElement]) {
+    let mut seen = BTreeMap::new();
+    for index in 0..elements.len() {
+        let Some(object) = elements[index].as_object() else {
+            continue;
+        };
+        let Some(id) = object.sequence else { continue };
+        if seen.insert(id, ()).is_some() {
+            continue;
+        }
+        let gap = elements[index + 1..]
+            .iter()
+            .filter_map(LabelElement::as_object)
+            .find(|object| object.sequence == Some(id))
+            .map_or(3.0, |object| object.frame.gap_mm);
+        elements[index].as_object_mut().unwrap().frame.gap_mm = gap;
+    }
+}
+
+/// Freeze formerly inactive head spacing before an explicit structural edit.
+/// Sequence IDs must already be materialized; persist v13 after this call.
+pub fn prepare_spacing(elements: &mut [LabelElement], version: u32) {
+    if version < 13 {
+        initialize_head_spacing(elements);
+    }
+}
+
+fn normalize(elements: &mut [LabelElement], anchors: &BTreeMap<u64, f64>) {
     let mut seen = BTreeMap::new();
     for o in elements.iter_mut().filter_map(LabelElement::as_object_mut) {
         let Some(id) = o.sequence else { continue };
-        let (anchor, gap) = &anchors[&id];
         if seen.insert(id, ()).is_none() {
             o.frame.position = PositionMode::Absolute;
-            o.frame.x_mm = anchor.x_mm;
-            o.frame.gap_mm = anchor.gap_mm;
+            o.frame.x_mm = anchors[&id];
         } else {
-            if o.frame.position == PositionMode::Absolute {
-                o.frame.gap_mm = *gap;
-            }
             o.frame.position = PositionMode::Relative;
             o.frame.x_mm = 0.0;
         }
@@ -224,7 +242,14 @@ fn normalize(elements: &mut [LabelElement], anchors: &BTreeMap<u64, (TextBox, f6
 
 /// Move a member between sequences, or change a free object's list order.
 /// All mutations happen on a candidate document so errors leave no partial edit.
-pub fn reorder(elements: &mut Vec<LabelElement>, from: usize, to: usize) -> Result<()> {
+/// After a successful move in a sequence, callers persist format v13 or newer:
+/// a head's gap is its dormant incoming spacing, never an origin/default cache.
+pub fn reorder(
+    elements: &mut Vec<LabelElement>,
+    from: usize,
+    to: usize,
+    version: u32,
+) -> Result<()> {
     if from >= elements.len() || to >= elements.len() {
         return Err(RenderError::Layout("reorder index is out of range".into()));
     }
@@ -234,6 +259,7 @@ pub fn reorder(elements: &mut Vec<LabelElement>, from: usize, to: usize) -> Resu
     validate(elements, 11)?;
     let mut candidate = elements.clone();
     materialize(&mut candidate)?;
+    prepare_spacing(&mut candidate, version);
     let source = candidate[from].as_object().unwrap().sequence;
     let target = candidate[to].as_object().unwrap().sequence;
     let anchors = anchors(&candidate);
@@ -243,12 +269,55 @@ pub fn reorder(elements: &mut Vec<LabelElement>, from: usize, to: usize) -> Resu
     {
         let object = item.as_object_mut().unwrap();
         object.sequence = Some(target);
-        object.frame.position = PositionMode::Relative;
-        object.frame.gap_mm = anchors[&target].1;
     }
     candidate.insert(to, item);
     normalize(&mut candidate, &anchors);
     validate(&candidate, 11)?;
+    *elements = candidate;
+    Ok(())
+}
+
+/// Connect whole sequences without changing their current physical positions.
+/// Reject overlapping/interleaved groups rather than silently clamping spacing.
+/// Persist v13 after success, just as for `reorder`.
+pub fn connect(
+    elements: &mut Vec<LabelElement>,
+    index: usize,
+    previous: usize,
+    version: u32,
+) -> Result<()> {
+    let mut candidate = elements.clone();
+    materialize(&mut candidate)?;
+    let source = members(&candidate, index)
+        .ok_or_else(|| RenderError::Layout("select a sequence to connect".into()))?;
+    let destination = members(&candidate, previous)
+        .ok_or_else(|| RenderError::Layout("select a preceding sequence".into()))?;
+    if source.first() != Some(&index)
+        || destination.last() != Some(&previous)
+        || previous >= index
+        || source == destination
+    {
+        return Err(RenderError::Layout(
+            "connect separate, non-interleaved sequences".into(),
+        ));
+    }
+    let frames = crate::scene::world_frames(&candidate)?;
+    let gap = frames[index].x_mm - frames[previous].x_mm - frames[previous].width_mm;
+    if gap < -1e-7 {
+        return Err(RenderError::Layout(
+            "sequences overlap; move the sequence start before connecting".into(),
+        ));
+    }
+    prepare_spacing(&mut candidate, version);
+    let id = candidate[previous].as_object().unwrap().sequence;
+    for i in source {
+        candidate[i].as_object_mut().unwrap().sequence = id;
+    }
+    let frame = &mut candidate[index].as_object_mut().unwrap().frame;
+    frame.position = PositionMode::Relative;
+    frame.x_mm = 0.0;
+    frame.gap_mm = gap.max(0.0);
+    validate(&candidate, 13)?;
     *elements = candidate;
     Ok(())
 }
@@ -358,7 +427,7 @@ mod tests {
     fn independent_rows_can_cross_sequences_without_rebinding_or_reflow() {
         let mut elements = fixture();
         let before = positions(&elements);
-        reorder(&mut elements, 6, 1).unwrap();
+        reorder(&mut elements, 6, 1, 13).unwrap();
         assert_eq!(
             positions(&elements),
             vec![
@@ -368,28 +437,135 @@ mod tests {
         assert_eq!(members(&elements, 0), Some(vec![0, 2, 3]));
         assert!(elements[1].as_object().unwrap().sequence.is_none());
         // Reorder after a free item has been interleaved in this chain.
-        reorder(&mut elements, 3, 0).unwrap();
+        reorder(&mut elements, 3, 0, 13).unwrap();
         assert_eq!(members(&elements, 0), Some(vec![0, 1, 3]));
         assert_eq!(positions(&elements)[2], 120.0);
     }
 
     #[test]
-    fn cross_sequence_moves_preserve_both_origins_and_use_destination_gap() {
+    fn cross_sequence_moves_preserve_origins_and_incoming_spacing() {
         let mut elements = fixture();
-        reorder(&mut elements, 2, 3).unwrap();
+        reorder(&mut elements, 2, 3, 13).unwrap();
         assert_eq!(members(&elements, 0), Some(vec![0, 1]));
         assert_eq!(members(&elements, 2), Some(vec![2, 3, 4, 5]));
         let p = positions(&elements);
         assert_eq!(&p[..3], &[0.0, 13.0, 60.0]);
-        assert!((p[3] - 72.8).abs() < 1e-9);
-        assert!((p[4] - 85.6).abs() < 1e-9);
+        assert!((p[3] - 73.0).abs() < 1e-9);
+        assert!((p[4] - 85.8).abs() < 1e-9);
         assert_eq!(p[6], 120.0);
         let mut elements = fixture();
-        reorder(&mut elements, 3, 2).unwrap();
+        reorder(&mut elements, 3, 2, 13).unwrap();
         let p = positions(&elements);
-        assert_eq!(&p[..4], &[0.0, 13.0, 26.0, 39.0]);
+        assert_eq!(&p[..4], &[0.0, 13.0, 25.8, 38.8]);
         assert_eq!(p[4], 60.0);
         assert!((p[5] - 72.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mixed_spacing_survives_head_promotion_crossing_and_reopening() {
+        let mut elements: Vec<_> = (0..5)
+            .map(|i| {
+                let mut object = LabelObject::text(
+                    format!("PORT {i}"),
+                    TextBox {
+                        width_mm: 14.5,
+                        height_mm: 8.0,
+                        position: if i == 0 || i == 4 {
+                            PositionMode::Absolute
+                        } else {
+                            PositionMode::Relative
+                        },
+                        x_mm: if i == 4 { 72.9 } else { 0.0 },
+                        gap_mm: [0.0, 2.8, 3.1, 3.1, 2.8][i],
+                        ..Default::default()
+                    },
+                );
+                object.sequence = Some(if i < 4 { 1 } else { 2 });
+                LabelElement::Object(object)
+            })
+            .collect();
+        let before = positions(&elements);
+        for from in 0..4 {
+            reorder(
+                &mut elements,
+                from,
+                from + 1,
+                if from == 0 { 12 } else { 13 },
+            )
+            .unwrap();
+            let mut doc = document(elements);
+            doc.version = 13;
+            elements = LabelDocument::from_toml_str(&doc.to_toml_string().unwrap())
+                .unwrap()
+                .elements;
+        }
+        for from in (1..=4).rev() {
+            reorder(&mut elements, from, from - 1, 13).unwrap();
+        }
+        assert_eq!(positions(&elements), before);
+        assert_eq!(elements[1].as_object().unwrap().frame.gap_mm, 2.8);
+    }
+
+    #[test]
+    fn legacy_heads_initialize_once_even_with_arbitrary_inactive_values() {
+        for dormant in [0.0, 3.0, 123.0] {
+            for gap in [0.0, 2.8] {
+                let mut elements = fixture();
+                materialize(&mut elements).unwrap();
+                elements[0].as_object_mut().unwrap().frame.gap_mm = dormant;
+                elements[1].as_object_mut().unwrap().frame.gap_mm = gap;
+                let before = positions(&elements);
+                reorder(&mut elements, 0, 1, 12).unwrap();
+                assert_eq!(elements[1].as_object().unwrap().frame.gap_mm, gap);
+                reorder(&mut elements, 1, 0, 13).unwrap();
+                assert_eq!(positions(&elements), before);
+            }
+        }
+    }
+
+    #[test]
+    fn generated_inverse_moves_keep_zero_gaps_widths_and_geometry() {
+        let mut seed = 0x6252576879_u64;
+        for case in 0..96 {
+            let mut elements = fixture();
+            materialize(&mut elements).unwrap();
+            for (i, e) in elements.iter_mut().enumerate() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let f = &mut e.as_object_mut().unwrap().frame;
+                f.width_mm = 2.0 + (seed % 91) as f64 / 10.0;
+                f.gap_mm = if (case + i) % 3 == 0 {
+                    0.0
+                } else {
+                    (seed % 37) as f64 / 10.0
+                };
+            }
+            let before = elements.clone();
+            let geometry = positions(&before);
+            for from in 0..elements.len() {
+                for to in members(&elements, from).unwrap_or_else(|| vec![from]) {
+                    reorder(&mut elements, from, to, 13).unwrap();
+                    reorder(&mut elements, to, from, 13).unwrap();
+                    assert_eq!(elements, before, "case {case}, {from} -> {to}");
+                    assert_eq!(positions(&elements), geometry);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn connecting_whole_sequences_preserves_positions_and_rejects_overlap_atomically() {
+        let mut elements = fixture();
+        materialize(&mut elements).unwrap();
+        let before = positions(&elements);
+        connect(&mut elements, 3, 2, 11).unwrap();
+        assert_eq!(positions(&elements), before);
+        assert_eq!(members(&elements, 0), Some(vec![0, 1, 2, 3, 4, 5]));
+        let mut overlapping = fixture();
+        overlapping[3].as_object_mut().unwrap().frame.x_mm = 20.0;
+        let before = overlapping.clone();
+        assert!(connect(&mut overlapping, 3, 2, 11).is_err());
+        assert_eq!(overlapping, before);
+        assert!(connect(&mut elements, 99, 2, 13).is_err());
     }
 
     #[test]
@@ -418,7 +594,7 @@ mod tests {
                     .iter()
                     .map(|e| e.as_object().unwrap().content.clone())
                     .collect();
-                reorder(&mut elements, from, to).unwrap();
+                reorder(&mut elements, from, to, 13).unwrap();
                 if from != to {
                     validate(&elements, 11).unwrap();
                 }
@@ -434,7 +610,7 @@ mod tests {
         }
         let mut elements = fixture();
         for i in 0..100 {
-            reorder(&mut elements, i % 7, (i * 3 + 1) % 7).unwrap();
+            reorder(&mut elements, i % 7, (i * 3 + 1) % 7, 13).unwrap();
         }
         validate(&elements, 11).unwrap();
     }
@@ -451,7 +627,7 @@ mod tests {
             let b =
                 render_document(&linked, u32::from(dpi) * 76 / 180, dpi, &mut renderer).unwrap();
             assert_eq!(a.bitmap, b.bitmap);
-            reorder(&mut linked.elements, 6, 1).unwrap();
+            reorder(&mut linked.elements, 6, 1, 13).unwrap();
             let c =
                 render_document(&linked, u32::from(dpi) * 76 / 180, dpi, &mut renderer).unwrap();
             let converted = crate::layout::convert_to_objects(
@@ -495,7 +671,7 @@ mod tests {
         bad[1].as_object_mut().unwrap().frame.position = PositionMode::Absolute;
         assert!(validate(&bad, 11).is_err());
         let before = elements.clone();
-        assert!(reorder(&mut elements, 9, 1).is_err());
+        assert!(reorder(&mut elements, 9, 1, 13).is_err());
         assert_eq!(elements, before);
     }
 }

@@ -28,7 +28,7 @@ pub use crate::layout::{
 };
 
 /// Newest supported on-disk layout format version.
-pub const DOCUMENT_VERSION: u32 = 12;
+pub const DOCUMENT_VERSION: u32 = 13;
 /// Empty layouts start at v4; content features raise the version when needed.
 pub const DEFAULT_DOCUMENT_VERSION: u32 = 4;
 
