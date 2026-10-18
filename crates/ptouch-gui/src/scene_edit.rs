@@ -875,10 +875,68 @@ impl AppState {
         if is_attached(self.elements.get(index)?) {
             return None;
         }
+        if let Some(chain) = self.flow_chain(index) {
+            let position = chain.iter().position(|i| *i == index)?;
+            return if down {
+                chain.get(position + 1).copied()
+            } else {
+                position.checked_sub(1).map(|i| chain[i])
+            };
+        }
         if down {
             (index + 1..self.elements.len()).find(|i| !is_attached(&self.elements[*i]))
         } else {
             self.previous_layout_index(index)
+        }
+    }
+
+    pub fn previous_sequence_end(&self, index: usize) -> Option<usize> {
+        let source = self.flow_chain(index)?;
+        let first = *source.first()?;
+        let id = self.elements[first].as_object()?.sequence?;
+        let previous = (0..first).rev().find(|i| {
+            self.elements[*i]
+                .as_object()
+                .is_some_and(|o| o.sequence.is_some_and(|other| other != id))
+        })?;
+        let destination = self.elements[previous].as_object()?.sequence?;
+        // An interleaved container has no unambiguous preceding end.
+        (!self.elements[previous + 1..].iter().any(|e| {
+            e.as_object()
+                .is_some_and(|o| o.sequence == Some(destination))
+        }))
+        .then_some(previous)
+    }
+
+    pub fn connect_sequence(&mut self, index: usize) -> bool {
+        let Some(first) = self
+            .flow_chain(index)
+            .and_then(|chain| chain.first().copied())
+        else {
+            return false;
+        };
+        let Some(previous) = self.previous_sequence_end(index) else {
+            return false;
+        };
+        let before = SceneSnapshot::take(self);
+        if let Err(error) =
+            sequence::connect(&mut self.elements, first, previous, self.document_version)
+        {
+            return self.fail_scene_transaction(before, error.to_string());
+        }
+        self.document_version = self.document_version.max(13);
+        if self.uses_scene() {
+            self.finish_scene_transaction(
+                before,
+                Some(index),
+                "Sequences connected; positions preserved. Adjust Gap before to change spacing.",
+            )
+        } else {
+            self.mark_dirty();
+            self.status_message =
+                "Sequences connected; positions preserved. Adjust Gap before to change spacing."
+                    .into();
+            true
         }
     }
 
@@ -1070,6 +1128,133 @@ mod tests {
     }
 
     #[test]
+    fn arrows_stop_at_sequence_edges_and_connect_preserves_all_frames() {
+        let mut state = fixture();
+        let object = state.elements[2].as_object_mut().unwrap();
+        object.sequence = Some(8);
+        object.frame.position = PositionMode::Absolute;
+        object.frame.x_mm = 52.5;
+        assert!(state.add_overlay_text(1));
+        assert_eq!(state.layout_neighbor(1, true), None);
+        assert_eq!(state.layout_neighbor(2, false), None);
+        assert_eq!(state.layout_neighbor(0, true), Some(1));
+        let before = worlds(&state);
+        assert!(state.connect_sequence(2));
+        for (after, before) in worlds(&state).iter().zip(before) {
+            assert_eq!(
+                (after.x_mm, after.y_mm, after.width_mm, after.height_mm),
+                (before.x_mm, before.y_mm, before.width_mm, before.height_mm)
+            );
+        }
+        assert_eq!(state.layout_neighbor(1, true), Some(2));
+        assert_eq!(state.document().version, 13);
+        // Promoting the zero-gap follower preserves its dormant spacing.
+        state.elements[1].as_object_mut().unwrap().frame.gap_mm = 0.0;
+        assert!(state.reorder_scene_element(1, 0));
+        let incoming = state.elements[0].as_object().unwrap().frame.gap_mm;
+        assert_eq!(incoming, 0.0);
+        assert!(state.duplicate_element(0));
+        let duplicate = state.selected_element.unwrap();
+        assert_eq!(
+            state.elements[duplicate].as_object().unwrap().frame.gap_mm,
+            0.0
+        );
+        assert!(state.delete_element(0));
+        assert_eq!(state.elements[0].as_object().unwrap().frame.gap_mm, 0.0);
+    }
+
+    #[test]
+    fn deleting_an_old_head_retains_the_promoted_members_original_gap() {
+        let mut state = fixture();
+        state.document_version = 12;
+        state.elements[0].as_object_mut().unwrap().frame.gap_mm = 0.0;
+        state.elements[1].as_object_mut().unwrap().frame.gap_mm = 2.8;
+        state.elements[2].as_object_mut().unwrap().frame.gap_mm = 3.1;
+        assert!(state.delete_element(0));
+        assert_eq!(state.document_version, 13);
+        assert_eq!(state.elements[0].as_object().unwrap().frame.gap_mm, 2.8);
+        let geometry = worlds(&state);
+        assert!(state.reorder_scene_element(0, 1));
+        assert!(state.reorder_scene_element(1, 0));
+        assert_eq!(worlds(&state), geometry);
+    }
+
+    #[test]
+    fn generated_host_moves_restore_geometry_selection_and_layers() {
+        let sample = ptouch_render::document::LabelDocument::from_toml_str(include_str!(
+            "../../../examples/shapes-overlays.ptl"
+        ))
+        .unwrap();
+        for case in 0..24 {
+            let mut state = fixture();
+            for index in 0..3 {
+                let object = state.elements[index].as_object_mut().unwrap();
+                object.content = match (case + index) % 6 {
+                    1 => sample.elements[4].as_object().unwrap().content.clone(),
+                    2 => sample.elements[3].as_object().unwrap().content.clone(),
+                    3 => ObjectContent::Line {
+                        pattern: Default::default(),
+                    },
+                    4 => ObjectContent::Padding,
+                    5 => ObjectContent::CutMark,
+                    _ => object.content.clone(),
+                };
+                object.frame.width_mm = 8.0 + ((case + index) % 11) as f64;
+                object.frame.gap_mm = if (case + index) % 3 == 0 {
+                    0.0
+                } else {
+                    2.8 + index as f64 / 10.0
+                };
+            }
+            for host in 0..3 {
+                for _ in 0..((case + host) % 3) {
+                    assert!(state.add_overlay_text(host));
+                }
+            }
+            scene::enable(&mut state.elements).unwrap();
+            state.document_version = 13;
+            state.elements = state
+                .layout_order()
+                .into_iter()
+                .map(|i| state.elements[i].clone())
+                .collect();
+            state.validate_scene_geometry().unwrap();
+            let baseline = state.document();
+            let geometry = worlds(&state);
+            let roots: Vec<_> = state
+                .layout_order()
+                .into_iter()
+                .filter(|i| !is_attached(&state.elements[*i]))
+                .map(|i| scene_id(&state.elements, i).unwrap())
+                .collect();
+            for from in 0..roots.len() {
+                for to in 0..roots.len() {
+                    if from == to {
+                        continue;
+                    }
+                    let index_of = |s: &AppState, id| {
+                        s.elements
+                            .iter()
+                            .position(|e| e.as_object().unwrap().scene.as_ref().unwrap().id == id)
+                            .unwrap()
+                    };
+                    let a = index_of(&state, roots[from]);
+                    let b = index_of(&state, roots[to]);
+                    assert!(state.reorder_scene_element(a, b));
+                    let moved = index_of(&state, roots[from]);
+                    assert_eq!(state.selected_element, Some(moved));
+                    let adjacent = if from < to { from + 1 } else { from - 1 };
+                    let target = index_of(&state, roots[adjacent]);
+                    assert!(state.reorder_scene_element(moved, target));
+                    assert_eq!(state.document(), baseline, "case {case}, {from}->{to}");
+                    assert_eq!(worlds(&state), geometry);
+                    assert_eq!(state.selected_element, Some(index_of(&state, roots[from])));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn joining_after_an_attached_row_uses_the_host_without_editing_the_child() {
         let mut state = fixture();
         let second = state.elements[2].as_object_mut().unwrap();
@@ -1087,6 +1272,39 @@ mod tests {
         assert_eq!(state.elements[2], child);
         assert_eq!(state.elements[3].as_object().unwrap().sequence, Some(7));
         assert_close(worlds(&state)[3].x_mm, 27.8);
+    }
+
+    #[test]
+    fn enabling_flow_while_joining_a_legacy_policy_keeps_the_whole_sequence() {
+        let mut state = fixture();
+        let mut fourth = state.elements[2].clone();
+        fourth.as_object_mut().unwrap().scene = None;
+        fourth.as_object_mut().unwrap().sequence = Some(8);
+        state.elements.push(fourth);
+        scene::enable(&mut state.elements).unwrap();
+        let head = state.elements[2].as_object_mut().unwrap();
+        head.sequence = Some(8);
+        head.layout = None;
+        head.frame.position = PositionMode::Absolute;
+        head.frame.x_mm = 52.5;
+        let mut edited = head.clone();
+        edited.layout = Some(LayoutOptions {
+            placement: Placement::Flow,
+            width: WidthSizing::Fixed,
+            constrain: false,
+            padding_mm: 0.0,
+        });
+        edited.frame.position = PositionMode::Relative;
+        edited.frame.gap_mm = 27.5;
+        state.apply_object_edit(2, edited).unwrap();
+        assert!(
+            state
+                .elements
+                .iter()
+                .all(|e| e.as_object().unwrap().sequence == Some(7))
+        );
+        assert_eq!(state.flow_chain(0), Some(vec![0, 1, 2, 3]));
+        assert_close(state.element_rect_mm(2).unwrap().0, 52.5);
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub struct TextBox {
     pub position: PositionMode,
     pub x_mm: f64,
     pub y_mm: f64,
+    /// Incoming sequence spacing. In v13 this is retained while an absolute
+    /// head temporarily does not use it; structural edits must not overwrite it.
     pub gap_mm: f64,
     pub vertical_align: VerticalAlign,
 }

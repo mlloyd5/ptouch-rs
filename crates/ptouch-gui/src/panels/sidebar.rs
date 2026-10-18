@@ -381,7 +381,18 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
             && object.sequence.is_some()
             && object.frame.position == ptouch_render::document::PositionMode::Absolute
         {
-            ui.small(format!("Sequence start · X {:.2} mm", object.frame.x_mm));
+            let x = object.frame.x_mm;
+            ui.horizontal_wrapped(|ui| {
+                ui.small(format!("Sequence · X {x:.2} mm"))
+                    .on_hover_text("Fixed sequence start. Up/Down stays in this sequence; dragging into another sequence moves the whole object.");
+                if state.previous_sequence_end(idx).is_some()
+                    && ui.small_button("Connect")
+                        .on_hover_text("Connect to the previous sequence without moving anything. Then adjust Gap before for continuous spacing.")
+                        .clicked()
+                {
+                    action = Some(ElementAction::Connect(idx));
+                }
+            });
         }
         let has_slot = !attached
             && matches!(
@@ -448,8 +459,8 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 action = Some(ElementAction::Duplicate(idx));
                 ui.close();
             }
-            if idx > 0 {
-                if state.can_swap_positions(idx, idx - 1)
+            if let Some(previous) = state.previous_layout_index(idx).filter(|_| !attached) {
+                if state.can_swap_positions(idx, previous)
                     && ui
                         .button("Swap positions with previous")
                         .on_hover_text(
@@ -457,10 +468,10 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                         )
                         .clicked()
                 {
-                    action = Some(ElementAction::SwapPositions(idx));
+                    action = Some(ElementAction::SwapPositions(idx, previous));
                     ui.close();
                 }
-                if state.can_swap_content(idx, idx - 1)
+                if state.can_swap_content(idx, previous)
                     && ui
                         .button("Swap content with previous")
                         .on_hover_text(
@@ -468,7 +479,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                         )
                         .clicked()
                 {
-                    action = Some(ElementAction::SwapContent(idx));
+                    action = Some(ElementAction::SwapContent(idx, previous));
                     ui.close();
                 }
             }
@@ -499,7 +510,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 state.flow_chain(source.0),
                 state.layout_host(idx).and_then(|i| state.flow_chain(i)),
             ) {
-                (Some(from), Some(to)) if from != to => "Move into sequence",
+                (Some(from), Some(to)) if from != to => "Move into fixed sequence · gap retained",
                 (Some(_), _) => "Reorder sequence",
                 _ => "List order · keep position",
             };
@@ -553,7 +564,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 state.selected_element.and_then(|i| state.layout_neighbor(i, false)).is_some(),
                 egui::Button::new("Up"),
             )
-            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
+            .on_hover_text("Move with attachments within this sequence. Connect sequences to reorder them as one continuous row.")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -565,7 +576,7 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
                 state.selected_element.and_then(|i| state.layout_neighbor(i, true)).is_some(),
                 egui::Button::new("Down"),
             )
-            .on_hover_text("Move with attachments. Crossing sequences keeps both fixed starts; use After previous to join them.")
+            .on_hover_text("Move with attachments within this sequence. Connect sequences to reorder them as one continuous row.")
             .clicked()
             && let Some(idx) = state.selected_element
         {
@@ -584,11 +595,14 @@ fn show_elements_section(ui: &mut egui::Ui, state: &mut AppState) {
     // Apply deferred action
     if let Some(act) = action {
         match act {
-            ElementAction::SwapPositions(index) => {
-                state.swap_positions(index, index - 1);
+            ElementAction::SwapPositions(index, previous) => {
+                state.swap_positions(index, previous);
             }
-            ElementAction::SwapContent(index) => {
-                state.swap_content(index, index - 1);
+            ElementAction::SwapContent(index, previous) => {
+                state.swap_content(index, previous);
+            }
+            ElementAction::Connect(index) => {
+                state.connect_sequence(index);
             }
             ElementAction::Duplicate(idx) => {
                 state.duplicate_element(idx);
@@ -620,8 +634,9 @@ fn move_element(state: &mut AppState, from: usize, to: usize) {
 
 /// Deferred actions for element list manipulation.
 enum ElementAction {
-    SwapPositions(usize),
-    SwapContent(usize),
+    SwapPositions(usize, usize),
+    SwapContent(usize, usize),
+    Connect(usize),
     Duplicate(usize),
     MoveUp(usize),
     MoveDown(usize),

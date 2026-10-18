@@ -307,7 +307,7 @@ impl PtouchApp {
 
         // Bottom status bar
         egui::Panel::bottom("status_bar").show(ui, |ui| {
-            panels::status_bar::show_status_bar(ui, &self.state);
+            panels::status_bar::show_status_bar(ui, &mut self.state);
         });
 
         if self.state.needs_rerender {
@@ -499,6 +499,82 @@ mod tests {
             },
             tx,
         )
+    }
+
+    #[test]
+    fn generated_canvas_events_survive_reorders_resizes_and_history() {
+        use ptouch_render::document::LabelDocument;
+        let doc =
+            LabelDocument::from_toml_str(include_str!("../../../examples/shapes-overlays.ptl"))
+                .unwrap();
+        let (mut app, _sender) = app(AppState {
+            elements: doc.elements,
+            document_version: doc.version,
+            font_name: doc.font_name,
+            ..Default::default()
+        });
+        let context = egui::Context::default();
+        let mut seed = 0x6252576879_u64;
+        for step in 0..240 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let (w, h) = if step % 3 == 0 {
+                (800.0, 500.0)
+            } else {
+                (1400.0, 900.0)
+            };
+            let pos = egui::pos2(
+                225.0 + (seed % 250) as f32,
+                110.0 + ((seed >> 16) % 280) as f32,
+            );
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if step % 4 == 0 || step % 4 == 2 {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: step % 4 == 0,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            if step % 17 == 0 {
+                app.state.layers_view = !app.state.layers_view;
+            }
+            if step % 53 == 7 && !app.state.elements.is_empty() {
+                app.state
+                    .duplicate_element((seed as usize) % app.state.elements.len());
+            }
+            if step % 41 == 11 && !app.state.elements.is_empty() {
+                app.state
+                    .delete_element((seed as usize) % app.state.elements.len());
+            }
+            if app.state.elements.is_empty() {
+                app.state.add_text();
+            }
+            if step % 19 == 0 {
+                app.state.history_step(step % 38 == 0);
+            }
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    time: Some(step as f64 / 30.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.show_editor(ui),
+            );
+            output.textures_delta.clear();
+            assert!(
+                app.state
+                    .selected_element
+                    .is_none_or(|i| i < app.state.elements.len())
+            );
+            let saved = app.state.document().to_toml_string().unwrap();
+            let reopened = LabelDocument::from_toml_str(&saved).unwrap();
+            assert_eq!(reopened, app.state.document());
+            assert!(ptouch_render::scene::world_frames(&app.state.elements).is_ok());
+        }
     }
 
     fn usb_status() -> PrinterEvent {
