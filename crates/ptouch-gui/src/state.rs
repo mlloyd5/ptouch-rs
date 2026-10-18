@@ -649,6 +649,15 @@ impl AppState {
                 return false;
             }
         } else {
+            if self
+                .elements
+                .iter()
+                .any(|e| e.as_object().is_some_and(|o| o.sequence.is_some()))
+            {
+                self.status_message =
+                    "Convert legacy elements before editing sequence membership".into();
+                return false;
+            }
             let item = self.elements.remove(from);
             self.elements.insert(to, item);
         }
@@ -1337,6 +1346,7 @@ impl AppState {
                 .any(|e| e.as_object().is_some_and(|o| o.sequence.is_some()))
             {
                 ptouch_render::sequence::prepare_spacing(&mut elements, self.document_version);
+                ptouch_render::sequence::validate(&elements, 13).map_err(|e| e.to_string())?;
                 self.elements = elements;
                 self.document_version = 13;
             }
@@ -1640,11 +1650,36 @@ mod tests {
             state.elements.push(LabelElement::Object(object));
         }
         state.document().to_toml_string().unwrap();
+        let original = state.document();
         assert!(state.delete_element(0));
         assert_eq!(state.document_version, 13);
         let implicit = state.elements[1].as_object().unwrap();
         assert!(implicit.sequence.is_some());
         assert_eq!(implicit.frame.gap_mm, 3.0);
+        let mut limited = AppState {
+            document_version: 11,
+            elements: original.elements,
+            ..Default::default()
+        };
+        for element in &mut limited.elements {
+            let object = element.as_object_mut().unwrap();
+            if object.sequence.is_some() {
+                object.sequence = Some(i64::MAX as u64);
+            }
+        }
+        let before = limited.document();
+        assert!(!limited.delete_element(0));
+        assert_eq!(limited.document(), before);
+        assert_eq!(limited.edit_revision, 0);
+        // An explicit sequence mixed with legacy pixel elements requires the
+        // existing conversion path, never the raw legacy list permutation.
+        limited
+            .elements
+            .insert(1, LabelElement::Padding { pixels: 1 });
+        let mixed = limited.document();
+        assert!(!limited.reorder_object(0, 2));
+        assert_eq!(limited.document(), mixed);
+        assert_eq!(limited.edit_revision, 0);
     }
 
     #[test]
