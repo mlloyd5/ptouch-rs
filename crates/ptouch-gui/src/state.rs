@@ -431,12 +431,20 @@ impl AppState {
                 let previous = elements[previous]
                     .as_object_mut()
                     .ok_or("Convert legacy elements before joining a sequence")?;
+                if self.document_version >= 13 && previous.sequence.is_none() {
+                    previous.frame.gap_mm = object.frame.gap_mm;
+                }
                 Self::use_flow_allocation(previous, self.printable_height_mm());
                 previous.sequence = Some(id);
                 object.frame.position = PositionMode::Relative;
                 object.frame.x_mm = 0.0;
             } else {
                 object.frame.position = PositionMode::Absolute;
+                if self.document_version >= 13
+                    && elements[index].as_object().unwrap().sequence.is_none()
+                {
+                    object.frame.gap_mm = 3.0;
+                }
                 object.frame.x_mm = elements[index].as_object().unwrap().frame.x_mm;
             }
         }
@@ -476,6 +484,9 @@ impl AppState {
                     .as_object_mut()
                     .ok_or("Convert legacy elements before joining a sequence")?;
                 Self::use_flow_allocation(previous, self.printable_height_mm());
+                if self.document_version >= 13 && previous.sequence.is_none() {
+                    previous.frame.gap_mm = object.frame.gap_mm;
+                }
                 previous.sequence = Some(id);
                 for i in chain {
                     elements[i].as_object_mut().unwrap().sequence = Some(id);
@@ -1151,8 +1162,11 @@ impl AppState {
         if self.elements.get(index).is_none() {
             return false;
         }
-        if self.flow_chain(index).is_some() {
-            self.prepare_sequence_spacing();
+        if self.flow_chain(index).is_some()
+            && let Err(error) = self.prepare_sequence_spacing()
+        {
+            self.status_message = error;
+            return false;
         }
         let sequence = !self.slot_followers(index).is_empty()
             || self.flow_chain(index).is_some()
@@ -1248,8 +1262,11 @@ impl AppState {
         if self.elements.get(index).is_none() {
             return false;
         }
-        if self.flow_chain(index).is_some() {
-            self.prepare_sequence_spacing();
+        if self.flow_chain(index).is_some()
+            && let Err(error) = self.prepare_sequence_spacing()
+        {
+            self.status_message = error;
+            return false;
         }
         let Some(element) = self.elements.get(index) else {
             return false;
@@ -1306,16 +1323,25 @@ impl AppState {
         true
     }
 
-    fn prepare_sequence_spacing(&mut self) {
-        if self.document_version < 13
-            && self
-                .elements
+    fn prepare_sequence_spacing(&mut self) -> Result<(), String> {
+        // Pre-v11 adjacent-relative layouts retain their existing edit semantics
+        // until an explicit modern sequence edit. A mixed v11+ document must
+        // prepare implicit groups too before its global v13 marker is written.
+        let modern =
+            self.document_version >= 11 || self.elements.iter().any(|e| e.minimum_version() >= 11);
+        if modern && self.document_version < 13 && self.is_free_layout() {
+            let mut elements = self.elements.clone();
+            ptouch_render::sequence::materialize(&mut elements).map_err(|e| e.to_string())?;
+            if elements
                 .iter()
                 .any(|e| e.as_object().is_some_and(|o| o.sequence.is_some()))
-        {
-            ptouch_render::sequence::prepare_spacing(&mut self.elements, self.document_version);
-            self.document_version = 13;
+            {
+                ptouch_render::sequence::prepare_spacing(&mut elements, self.document_version);
+                self.elements = elements;
+                self.document_version = 13;
+            }
         }
+        Ok(())
     }
 
     pub fn add_text(&mut self) {
@@ -1568,6 +1594,58 @@ fn content_box_for_frame(frame: &TextBox) -> ContentBox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_sequence_in_a_v13_document_still_has_default_spacing() {
+        let mut state = AppState {
+            document_version: 13,
+            ..Default::default()
+        };
+        state.add_text();
+        let mut object = state.elements[0].as_object().unwrap().clone();
+        object.layout.as_mut().unwrap().placement = ptouch_render::object_layout::Placement::Flow;
+        state.apply_object_edit(0, object).unwrap();
+        state.add_text();
+        assert_eq!(state.elements[1].as_object().unwrap().frame.gap_mm, 3.0);
+    }
+
+    #[test]
+    fn spacing_upgrade_also_prepares_other_implicit_sequences() {
+        let mut state = AppState {
+            document_version: 11,
+            ..Default::default()
+        };
+        for i in 0..3 {
+            let mut object = LabelObject::text(
+                format!("P{i}"),
+                TextBox {
+                    x_mm: if i == 2 { 100.0 } else { 0.0 },
+                    position: if i == 1 {
+                        PositionMode::Relative
+                    } else {
+                        PositionMode::Absolute
+                    },
+                    gap_mm: if i == 1 { 2.8 } else { 0.0 },
+                    ..Default::default()
+                },
+            );
+            object.sequence = if i < 2 { Some(1) } else { None };
+            object.content_box = Some(content_box_for_frame(&object.frame));
+            object.layout = Some(ptouch_render::object_layout::LayoutOptions {
+                placement: ptouch_render::object_layout::Placement::Flow,
+                width: ptouch_render::object_layout::WidthSizing::Fixed,
+                constrain: false,
+                padding_mm: 0.0,
+            });
+            state.elements.push(LabelElement::Object(object));
+        }
+        state.document().to_toml_string().unwrap();
+        assert!(state.delete_element(0));
+        assert_eq!(state.document_version, 13);
+        let implicit = state.elements[1].as_object().unwrap();
+        assert!(implicit.sequence.is_some());
+        assert_eq!(implicit.frame.gap_mm, 3.0);
+    }
 
     #[test]
     fn explicit_absolute_and_relative_switches_split_and_join_the_same_members() {
