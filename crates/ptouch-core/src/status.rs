@@ -270,6 +270,17 @@ impl PrinterStatus {
     ///
     /// Brother reports this as a phase change to the editing state with
     /// phase number zero ("Waiting to receive").
+    /// The printer has fed the tape and waits for it to be cut (notification
+    /// 0x0B, PT-E310BT manual cutter).
+    pub fn is_cut_wait_started(&self) -> bool {
+        self.status_type == 0x05 && self.notification_number == 0x0B
+    }
+
+    /// The tape was cut and the printer carries on (notification 0x0C).
+    pub fn is_cut_wait_finished(&self) -> bool {
+        self.status_type == 0x05 && self.notification_number == 0x0C
+    }
+
     pub fn is_waiting_to_receive(&self) -> bool {
         self.status_type == 0x06
             && self.phase_type == 0x00
