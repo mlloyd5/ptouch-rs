@@ -693,10 +693,18 @@ where
     let started = Instant::now();
     let mut last_transfer = Instant::now();
     let mut frames = StatusFrameBuffer::new();
+    // While a manual-cutter printer waits for the tape to be cut nothing
+    // arrives, so only the job deadline applies.
+    let mut waiting_for_cut = false;
 
     loop {
-        let Some(remaining) = idle_timeout.checked_sub(last_transfer.elapsed()) else {
-            return Err(PtouchError::Timeout);
+        let remaining = if waiting_for_cut {
+            idle_timeout
+        } else {
+            match idle_timeout.checked_sub(last_transfer.elapsed()) {
+                Some(remaining) => remaining,
+                None => return Err(PtouchError::Timeout),
+            }
         };
 
         let total_remaining = total_timeout
@@ -753,12 +761,21 @@ where
         let status = parse_status_packet(&response, "Invalid status header after print")?;
 
         debug!(
-            "Print status: type={}, phase_type={:#04x}, phase={:#04x}{:02x}",
+            "Print status: type={}, phase_type={:#04x}, phase={:#04x}{:02x}, notification={:#04x}",
             status.status_type_name(),
             status.phase_type,
             status.phase_number_hi,
-            status.phase_number_lo
+            status.phase_number_lo,
+            status.notification_number
         );
+
+        if status.is_cut_wait_started() {
+            info!("Printer is waiting for the tape to be cut");
+            waiting_for_cut = true;
+        } else if status.is_cut_wait_finished() {
+            debug!("Tape cut, printer continues");
+            waiting_for_cut = false;
+        }
 
         if print_status_is_ready(&status)? {
             debug!("Printer is ready to receive the next page");
@@ -1439,6 +1456,70 @@ mod tests {
                     Ok(transfer.len())
                 }
                 Err(error) => Err(error),
+            },
+            Duration::from_millis(1),
+        );
+
+        assert!(matches!(result, Err(PtouchError::Timeout)));
+    }
+
+    #[test]
+    fn print_status_waits_through_a_manual_cut() {
+        // PT-E310BT with auto cut: silence between "cut wait started" and
+        // "cut wait finished" must not trip the idle timeout.
+        let mut cut_started = status_packet(0x05, 0x01);
+        cut_started[22] = 0x0B;
+        let mut cut_finished = status_packet(0x05, 0x01);
+        cut_finished[22] = 0x0C;
+        let mut transfers = VecDeque::from([
+            Ok(status_packet(0x06, 0x01).to_vec()),
+            Ok(cut_started.to_vec()),
+            Err(PtouchError::Timeout),
+            Err(PtouchError::Timeout),
+            Err(PtouchError::Timeout),
+            Ok(cut_finished.to_vec()),
+            Ok(status_packet(0x01, 0x01).to_vec()),
+            Ok(status_packet(0x06, 0x00).to_vec()),
+        ]);
+
+        let status = receive_print_status_with_timeout(
+            |buf, _timeout| match transfers.pop_front().unwrap_or(Err(PtouchError::Timeout)) {
+                Ok(transfer) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    buf[..transfer.len()].copy_from_slice(&transfer);
+                    Ok(transfer.len())
+                }
+                Err(error) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    Err(error)
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .unwrap();
+
+        assert!(status.is_waiting_to_receive());
+        assert!(transfers.is_empty());
+    }
+
+    #[test]
+    fn print_status_still_times_out_when_idle_without_a_cut_wait() {
+        let mut transfers = VecDeque::from([
+            Ok(status_packet(0x06, 0x01).to_vec()),
+            Err(PtouchError::Timeout),
+            Err(PtouchError::Timeout),
+        ]);
+
+        let result = receive_print_status_with_timeout(
+            |buf, _timeout| match transfers.pop_front().unwrap_or(Err(PtouchError::Timeout)) {
+                Ok(transfer) => {
+                    buf[..transfer.len()].copy_from_slice(&transfer);
+                    Ok(transfer.len())
+                }
+                Err(error) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    Err(error)
+                }
             },
             Duration::from_millis(1),
         );
